@@ -40,13 +40,14 @@
 </head>
 <body>
 <h1>空运危险品保管链控制台</h1>
-<p class="sub">录入运单与扫描批次、查询可信交接前缀。OpenAPI 交互文档见 <a href="/docs">/docs</a>。</p>
+<p class="sub">录入运单与扫描批次、查询可信交接前缀、登记保管方危险品许可并复查缺证交接。OpenAPI 交互文档见 <a href="/docs">/docs</a>。</p>
 
 <div class="grid">
   <div class="card">
-    <h2>1. 创建运单（固定起始保管方）</h2>
+    <h2>1. 创建运单（固定起始保管方 / 许可类别）</h2>
     <label>运单号</label><input id="wb-id" placeholder="AWB-001" value="AWB-001" />
     <label>起始保管方</label><input id="wb-origin" placeholder="HKG-WAREHOUSE" value="HKG-WAREHOUSE" />
+    <label>许可类别（留空默认 DANGEROUS_GOODS）</label><input id="wb-category" placeholder="DG-CLASS-3" value="DG-CLASS-3" />
     <button onclick="createWaybill()">创建运单</button>
     <div id="status"></div>
   </div>
@@ -75,6 +76,35 @@
   </div>
 
   <div class="card">
+    <h2>4. 整批替换保管方许可（UTC 半开区间 [起点, 终点)）</h2>
+    <div class="row">
+      <div><label>保管方</label><input id="perm-party" value="CX-CARGO" /></div>
+      <div><label>许可类别</label><input id="perm-category" value="DG-CLASS-3" /></div>
+    </div>
+    <label>区间 JSON（传空列表 [] 清除登记）</label>
+    <textarea id="perm-json" style="min-height:90px">{
+  "intervals": [
+    {"valid_from": "2026-11-18T00:00:00Z", "valid_to": "2026-11-19T00:00:00Z"}
+  ]
+}</textarea>
+    <div class="row">
+      <button onclick="replacePermits()" style="margin-top:12px">替换许可</button>
+      <button class="secondary" onclick="queryPermits()" style="margin-top:12px">查询当前登记</button>
+      <button class="secondary" onclick="queryCustodianPending()" style="margin-top:12px">按保管方查待核</button>
+    </div>
+    <div id="perm-summary" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h2>5. 危险品交接复查（自动纳入同一许可类别全部运单）</h2>
+    <label>运单号</label>
+    <div class="row"><input id="audit-wb" value="AWB-001" />
+      <button onclick="runAudit()" style="margin-top:0">复查</button></div>
+    <div id="audit-summary" style="margin-top:10px"></div>
+    <div id="audit-table"></div>
+  </div>
+
+  <div class="card">
     <h2>原始响应</h2>
     <pre id="raw">（提交或查询后显示）</pre>
   </div>
@@ -99,7 +129,13 @@ async function call(url, method, body) {
 }
 async function createWaybill() {
   try {
-    await call('/api/waybills', 'POST', {waybill_id: $('wb-id').value.trim(), origin_party: $('wb-origin').value.trim()});
+    const payload = {
+      waybill_id: $('wb-id').value.trim(),
+      origin_party: $('wb-origin').value.trim(),
+    };
+    const cat = $('wb-category').value.trim();
+    if (cat) payload.permit_category = cat;
+    await call('/api/waybills', 'POST', payload);
     setStatus('运单已创建');
   } catch (e) { setStatus('失败：' + e.message, true); }
 }
@@ -133,6 +169,60 @@ function renderChain(c) {
     + `<td>${esc(r.scan_id)}</td><td>${r.revision}</td><td>${esc(r.ts_utc)}</td>`
     + `<td>${esc(r.giver)}</td><td>${esc(r.receiver)}</td>`
     + `<td>${esc(r.unverified_reason ?? '')}</td></tr>`).join('') + '</table>';
+}
+async function replacePermits() {
+  try {
+    const party = encodeURIComponent($('perm-party').value.trim());
+    const cat = encodeURIComponent($('perm-category').value.trim());
+    const body = JSON.parse($('perm-json').value);
+    const data = await call(`/api/custodians/${party}/permits/${cat}`, 'PUT', body);
+    $('perm-summary').innerHTML =
+      `<span class="pill bad">新增待核 ${data.added.length}</span> ` +
+      `<span class="pill ok">解除待核 ${data.removed.length}</span>`;
+    setStatus('许可已整批替换（区间数 ' + data.intervals.length + '）');
+  } catch (e) { setStatus('替换失败（旧登记与清单保留）：' + e.message, true); }
+}
+async function queryPermits() {
+  try {
+    const party = encodeURIComponent($('perm-party').value.trim());
+    const cat = encodeURIComponent($('perm-category').value.trim());
+    const data = await call(`/api/custodians/${party}/permits/${cat}`, 'GET');
+    $('perm-summary').innerHTML = '当前登记区间：' +
+      (data.intervals.length ? data.intervals.map(i =>
+        `[${esc(i.valid_from)}, ${esc(i.valid_to)})`).join('；') : '（空，已清除）');
+    setStatus('许可登记查询完成');
+  } catch (e) { setStatus('查询失败：' + e.message, true); }
+}
+async function queryCustodianPending() {
+  try {
+    const party = encodeURIComponent($('perm-party').value.trim());
+    const cat = $('perm-category').value.trim();
+    const qs = cat ? `?permit_category=${encodeURIComponent(cat)}` : '';
+    const data = await call(`/api/custodians/${party}/pending${qs}`, 'GET');
+    $('perm-summary').innerHTML = `保管方待核项：<b>${data.items.length}</b> 条`;
+    renderPending(data.items, 'audit-table');
+    setStatus('按保管方待核查询完成');
+  } catch (e) { setStatus('查询失败：' + e.message, true); }
+}
+async function runAudit() {
+  try {
+    const wid = encodeURIComponent($('audit-wb').value.trim());
+    const data = await call(`/api/waybills/${wid}/permit-audit`, 'GET');
+    const parties = Object.keys(data.by_missing_party);
+    $('audit-summary').innerHTML =
+      `许可类别 <b>${esc(data.permit_category)}</b>（含同类全部运单）；` +
+      `缺证保管方：${parties.length ? parties.map(esc).join('、') : '无'}；待核 <b>${data.items.length}</b> 条`;
+    renderPending(data.items, 'audit-table');
+    setStatus('复查完成');
+  } catch (e) { setStatus('复查失败：' + e.message, true); }
+}
+function renderPending(items, tableId) {
+  if (!items.length) { $(tableId).innerHTML = '<p class="hint">没有缺证待核交接。</p>'; return; }
+  $(tableId).innerHTML = '<table><tr><th>运单号</th><th>扫描 ID</th><th>修订</th>'
+    + '<th>交接时刻 (UTC)</th><th>缺证方</th><th>角色</th></tr>' + items.map(i =>
+    `<tr><td>${esc(i.waybill_id)}</td><td>${esc(i.scan_id)}</td><td>${i.revision}</td>`
+    + `<td>${esc(i.handover_ts_utc)}</td><td>${esc(i.missing_party)}</td><td>${esc(i.role)}</td></tr>`
+  ).join('') + '</table>';
 }
 </script>
 </body>

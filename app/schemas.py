@@ -9,6 +9,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+# Waybills created without an explicit permit category fall back to this one,
+# so legacy clients (and pre-permit SQLite volumes) keep working unchanged.
+DEFAULT_PERMIT_CATEGORY = "DANGEROUS_GOODS"
+
 
 # --------------------------------------------------------------------------- #
 # Requests
@@ -18,8 +22,13 @@ class WaybillCreate(BaseModel):
 
     waybill_id: str = Field(min_length=1, description="运单号，全局唯一")
     origin_party: str = Field(min_length=1, description="固定起始保管方")
+    permit_category: str = Field(
+        default=DEFAULT_PERMIT_CATEGORY,
+        min_length=1,
+        description="许可类别；核查时同一类别下的所有运单一并纳入",
+    )
 
-    @field_validator("waybill_id", "origin_party")
+    @field_validator("waybill_id", "origin_party", "permit_category")
     @classmethod
     def _strip_nonempty(cls, v: str) -> str:
         v = v.strip()
@@ -145,6 +154,7 @@ class ScanView(BaseModel):
 class ChainResponse(BaseModel):
     waybill_id: str
     origin_party: str
+    permit_category: str = DEFAULT_PERMIT_CATEGORY
     current_custodian: str
     verified_prefix: list[ScanView]
     unverified_scans: list[ScanView]
@@ -160,6 +170,104 @@ class BatchResponse(BaseModel):
     idempotent_duplicates: int
     withdrawn_scan_ids: list[str]
     chain: ChainResponse
+    # 本次提交后该运单仍在待核清单中的缺证交接（随可信前缀同步更新）
+    permit_pending: list["PendingItem"] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Permit registry & re-audit (待核清单)
+# --------------------------------------------------------------------------- #
+class PermitInterval(BaseModel):
+    """一个半开 UTC 有效期 [valid_from, valid_to)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    valid_from: datetime = Field(description="有效期起点（含），ISO-8601 且必须带时区")
+    valid_to: datetime = Field(description="有效期终点（不含），ISO-8601 且必须带时区")
+
+    @field_validator("valid_from", "valid_to")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("permit timestamps must carry an explicit timezone offset, e.g. ...Z or +08:00")
+        return v
+
+    @model_validator(mode="after")
+    def _check_half_open(self) -> "PermitInterval":
+        if self.valid_to <= self.valid_from:
+            raise ValueError("permit interval must be half-open [valid_from, valid_to) with valid_to > valid_from")
+        return self
+
+
+class PermitReplace(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intervals: list[PermitInterval] = Field(
+        description="整批替换后的 UTC 有效期区间列表；传空列表清除该保管方在该类别下的全部登记"
+    )
+
+    @model_validator(mode="after")
+    def _check_no_overlap(self) -> "PermitReplace":
+        spans = sorted(
+            (iv.valid_from.astimezone(timezone.utc), iv.valid_to.astimezone(timezone.utc))
+            for iv in self.intervals
+        )
+        for (f1, t1), (f2, t2) in zip(spans, spans[1:]):
+            if f2 < t1:
+                raise ValueError(
+                    f"permit intervals overlap: [{f1.isoformat()}, {t1.isoformat()}) "
+                    f"vs [{f2.isoformat()}, {t2.isoformat()})"
+                )
+        return self
+
+
+class PendingItem(BaseModel):
+    """一条缺证交接的待核记录。"""
+
+    waybill_id: str
+    permit_category: str
+    scan_id: str
+    revision: int
+    handover_ts_utc: datetime
+    missing_party: str
+    role: Literal["GIVER", "RECEIVER", "BOTH"] = Field(
+        description="缺证方在该笔交接中的角色；BOTH 表示交出方与接收方为同一方且均缺证"
+    )
+
+
+class PermitPendingChange(BaseModel):
+    """一次许可替换在待核清单上产生的增量。"""
+
+    added: list[PendingItem] = Field(default_factory=list)
+    removed: list[PendingItem] = Field(default_factory=list)
+
+
+class PermitReplaceResponse(BaseModel):
+    custodian: str
+    permit_category: str
+    intervals: list[PermitInterval]
+    added: list[PendingItem]
+    removed: list[PendingItem]
+
+
+class PermitListResponse(BaseModel):
+    custodian: str
+    permit_category: str
+    intervals: list[PermitInterval]
+
+
+class CustodianPendingResponse(BaseModel):
+    custodian: str
+    permit_category: str | None = None
+    items: list[PendingItem]
+
+
+class PermitAuditResponse(BaseModel):
+    waybill_id: str
+    permit_category: str
+    items: list[PendingItem]
+    # 按缺证方分组的视图，便于复查时直接定位保管方
+    by_missing_party: dict[str, list[PendingItem]]
 
 
 # --------------------------------------------------------------------------- #

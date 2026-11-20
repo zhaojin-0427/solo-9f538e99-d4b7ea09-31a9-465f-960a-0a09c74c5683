@@ -46,15 +46,21 @@ def create_waybill(conn: sqlite3.Connection, body: WaybillCreate) -> dict:
         if existing is not None:
             raise DomainConflict(f"waybill {body.waybill_id!r} already exists")
         conn.execute(
-            "INSERT INTO waybills (id, origin_party, created_at) VALUES (?, ?, ?)",
-            (body.waybill_id, body.origin_party, utcnow_iso()),
+            "INSERT INTO waybills (id, origin_party, permit_category, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (body.waybill_id, body.origin_party, body.permit_category, utcnow_iso()),
         )
-    return {"waybill_id": body.waybill_id, "origin_party": body.origin_party}
+    return {
+        "waybill_id": body.waybill_id,
+        "origin_party": body.origin_party,
+        "permit_category": body.permit_category,
+    }
 
 
 def get_waybill(conn: sqlite3.Connection, waybill_id: str) -> sqlite3.Row:
     row = conn.execute(
-        "SELECT id, origin_party FROM waybills WHERE id = ?", (waybill_id,)
+        "SELECT id, origin_party, permit_category FROM waybills WHERE id = ?",
+        (waybill_id,),
     ).fetchone()
     if row is None:
         raise DomainValidation(f"waybill {waybill_id!r} not found")
@@ -67,9 +73,11 @@ def get_waybill(conn: sqlite3.Connection, waybill_id: str) -> sqlite3.Row:
 def apply_batch(
     conn: sqlite3.Connection, waybill_id: str, batch: BatchSubmit
 ) -> BatchResponse:
+    from . import permits
     from .database import transaction
 
-    get_waybill(conn, waybill_id)  # 404-style check before opening the txn
+    waybill = get_waybill(conn, waybill_id)  # 404-style check before opening the txn
+    category = waybill["permit_category"]
 
     applied = 0
     idempotent = 0
@@ -85,15 +93,27 @@ def apply_batch(
                 withdrawn.append(entry.scan_id)
             applied += 1
 
-    # Recompute against the freshly committed snapshot.  Scan writes and the
-    # returned query result therefore become visible together.
-    chain = compute_chain(conn, waybill_id)
+        # Recompute the chain against this transaction's own writes, then
+        # rebuild the materialized trusted prefix and the pending worklist in
+        # the SAME transaction.  Scans, trusted-prefix state and permit
+        # decisions therefore become visible atomically on commit.
+        chain = _compute_chain_locked(conn, waybill_id)
+        permits.rebuild_waybill_materialized(conn, waybill_id, category, chain)
+        pending_rows = conn.execute(
+            "SELECT * FROM permit_pending WHERE waybill_id = ? ORDER BY handover_ts, scan_id, missing_party",
+            (waybill_id,),
+        ).fetchall()
+
+    # Read-only mapping after commit; readers on other connections see the
+    # same fully committed snapshot.
+    pending = [permits._row_to_pending(r) for r in pending_rows]
     return BatchResponse(
         waybill_id=waybill_id,
         applied=applied,
         idempotent_duplicates=idempotent,
         withdrawn_scan_ids=withdrawn,
         chain=chain,
+        permit_pending=pending,
     )
 
 
@@ -187,6 +207,13 @@ def _parse_ts(text: str) -> datetime:
 
 
 def compute_chain(conn: sqlite3.Connection, waybill_id: str) -> ChainResponse:
+    from .database import read_snapshot
+
+    with read_snapshot(conn):
+        return _compute_chain_locked(conn, waybill_id)
+
+
+def _compute_chain_locked(conn: sqlite3.Connection, waybill_id: str) -> ChainResponse:
     waybill = get_waybill(conn, waybill_id)
     origin = waybill["origin_party"]
 
@@ -255,6 +282,7 @@ def compute_chain(conn: sqlite3.Connection, waybill_id: str) -> ChainResponse:
     return ChainResponse(
         waybill_id=waybill_id,
         origin_party=origin,
+        permit_category=waybill["permit_category"],
         current_custodian=custodian,
         verified_prefix=verified,
         unverified_scans=unverified,
